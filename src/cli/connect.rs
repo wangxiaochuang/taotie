@@ -1,4 +1,5 @@
 use clap::{ArgMatches, Parser};
+use datafusion::datasource::file_format::file_compression_type::FileCompressionType;
 
 use crate::{Backend, CmdExecutor, ReplContext, ReplMsg};
 
@@ -7,9 +8,30 @@ use super::ReplResult;
 #[derive(Debug, Clone)]
 pub enum DatasetConn {
     Postgres(String),
-    Csv(String),
+    Csv(FileOpts),
     Parquet(String),
-    NdJson(String),
+    NdJson(FileOpts),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileOpts {
+    pub filename: String,
+    pub ext: String,
+    pub compression: FileCompressionType,
+}
+
+impl FileOpts {
+    pub fn new(
+        filename: impl Into<String>,
+        ext: impl Into<String>,
+        compression: FileCompressionType,
+    ) -> Self {
+        Self {
+            filename: filename.into(),
+            ext: ext.into(),
+            compression,
+        }
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -53,16 +75,64 @@ impl CmdExecutor for ConnectOpts {
 }
 
 fn verify_conn_str(s: &str) -> Result<DatasetConn, String> {
-    let conn_str = s.to_string();
-    if conn_str.starts_with("postgres://") {
-        Ok(DatasetConn::Postgres(conn_str))
-    } else if conn_str.ends_with(".csv") {
-        Ok(DatasetConn::Csv(conn_str))
-    } else if conn_str.ends_with(".parquet") {
-        Ok(DatasetConn::Parquet(conn_str))
-    } else if conn_str.ends_with(".json") {
-        Ok(DatasetConn::NdJson(conn_str))
-    } else {
-        Err(format!("Invalid connection string: {}", s))
+    if s.starts_with("postgres://") {
+        return Ok(DatasetConn::Postgres(s.to_owned()));
+    }
+    let opt = get_file_opt(s).ok_or(format!("invalid connection string: {}", s))?;
+    match opt.ext.as_str() {
+        "csv" => Ok(DatasetConn::Csv(opt)),
+        "json" | "jsonl" | "ndjson" => Ok(DatasetConn::NdJson(opt)),
+        "parquet" => Ok(DatasetConn::Parquet(s.to_string())),
+        v => Err(format!("unsupported file extension: {}", v)),
+    }
+}
+
+fn get_file_opt(conn_str: &str) -> Option<FileOpts> {
+    let mut exts = conn_str.rsplitn(3, '.');
+    let ext = exts.next()?;
+    let compression = match ext {
+        "gz" => FileCompressionType::GZIP,
+        "bz2" => FileCompressionType::BZIP2,
+        "xz" => FileCompressionType::XZ,
+        "zstd" => FileCompressionType::ZSTD,
+        v => {
+            let filetype = v;
+            let _ = exts.next()?;
+            return Some(FileOpts::new(
+                conn_str,
+                filetype,
+                FileCompressionType::UNCOMPRESSED,
+            ));
+        }
+    };
+    let filetype = exts.next()?;
+    let _ = exts.next()?;
+
+    Some(FileOpts::new(conn_str, filetype, compression))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_conn_str() {
+        let opt = get_file_opt("foo.csv.bz2").unwrap();
+        assert_eq!(
+            opt,
+            FileOpts::new("foo.csv.bz2", "csv", FileCompressionType::BZIP2)
+        );
+        let opt = get_file_opt("foo.csv").unwrap();
+        assert_eq!(
+            opt,
+            FileOpts::new("foo.csv", "csv", FileCompressionType::UNCOMPRESSED)
+        );
+        let opt = get_file_opt("foo.bar").unwrap();
+        assert_eq!(
+            opt,
+            FileOpts::new("foo.bar", "bar", FileCompressionType::UNCOMPRESSED)
+        );
+        let opt = get_file_opt("foobar");
+        assert!(opt.is_none());
     }
 }
